@@ -84,7 +84,11 @@ describe('merkle root', () => {
   it('changes if any leaf changes', () => {
     const commitment = commitPayload(payload);
     const mutated = commitment.leaves.map((leaf, i) =>
-      i === 0 ? { ...leaf, digest: leaf.digest.replace(/^./, '0') } : leaf,
+      // Flip the first nibble to a guaranteed-different value. Replacing it with a constant
+      // is a no-op whenever the digest already starts with that character.
+      i === 0
+        ? { ...leaf, digest: (leaf.digest[0] === '0' ? '1' : '0') + leaf.digest.slice(1) }
+        : leaf,
     );
     expect(merkleRoot(mutated)).not.toBe(commitment.root);
   });
@@ -137,6 +141,36 @@ describe('root recomputation (the redaction-safety property)', () => {
     });
     expect(root).not.toBe(commitment.root);
     expect(mismatchedPaths).toContain('amount');
+  });
+
+  it('treats a container emptied by redaction as erasure, not injection', () => {
+    // Redacting the last surviving field of an object leaves `{account:{}}`, and flatten
+    // commits empty containers as leaves - so the naive check reads the emptied container as
+    // an injected field and reports a false tamper on a legitimate erasure.
+    const commitment = commitPayload({ account: { number: '123456789' }, keep: 1 });
+    const salts = { ...commitment.salts };
+    delete salts['account.number'];
+
+    const { root, mismatchedPaths } = recomputeRoot({
+      storedLeaves: commitment.leaves,
+      salts,
+      payload: { account: {}, keep: 1 },
+    });
+
+    expect(mismatchedPaths).toEqual([]);
+    expect(root).toBe(commitment.root);
+  });
+
+  it('still rejects an empty container injected where nothing was committed', () => {
+    const commitment = commitPayload({ keep: 1 });
+    const { root, mismatchedPaths } = recomputeRoot({
+      storedLeaves: commitment.leaves,
+      salts: commitment.salts,
+      payload: { keep: 1, injected: {} },
+    });
+
+    expect(mismatchedPaths).toContain('injected');
+    expect(root).not.toBe(commitment.root);
   });
 
   it('detects a field appended to the payload after the fact', () => {

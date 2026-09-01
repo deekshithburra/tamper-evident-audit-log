@@ -262,12 +262,19 @@ export class AuditRepository {
     }
   }
 
-  /** Records eligible for archival: active, and recorded before the cutoff. */
+  /**
+   * Records eligible for archival: active, and recorded at or before the cutoff.
+   *
+   * The bound is inclusive deliberately. `recorded_at` has millisecond resolution, so with a
+   * strict `<` any record written in the same millisecond the cutoff was computed is skipped -
+   * leaving a trickle of records straddling every run boundary, and making a zero-day window
+   * non-deterministic. Inclusive is both simpler to reason about and stable.
+   */
   findArchivable(cutoffIso: string, limit: number): StoredRecord[] {
     const rows = this.db
       .prepare(
         `SELECT * FROM audit_events
-         WHERE lifecycle_state = 'active' AND recorded_at < ? ORDER BY seq ASC LIMIT ?`,
+         WHERE lifecycle_state = 'active' AND recorded_at <= ? ORDER BY seq ASC LIMIT ?`,
       )
       .all(cutoffIso, limit) as Row[];
     return rows.map(toRecord);

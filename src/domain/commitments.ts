@@ -180,9 +180,37 @@ export function recomputeRoot(input: {
   const knownPaths = new Set(input.storedLeaves.map((leaf) => leaf.path));
   for (const [path, value] of present) {
     if (knownPaths.has(path)) continue;
+
+    // A container emptied by redaction is not an injected field.
+    //
+    // `flatten` commits an empty object or array as a leaf of its own, so redacting the last
+    // surviving field of `account` turns `{account:{number:...}}` into `{account:{}}` and
+    // produces a leaf path (`account`) that was never committed. That is a legitimate
+    // consequence of erasure, not tampering, and it is recognisable: the emptied container
+    // still has committed descendants, whose digests are retained and re-checked above.
+    //
+    // This is not an exploitable hole. To reach this branch an attacker must present an empty
+    // container at a path with stored descendant leaves - and those leaves remain committed to
+    // the root regardless, so the values they cover cannot be altered or removed unnoticed.
+    if (isEmptyContainer(value) && hasStoredDescendant(knownPaths, path)) continue;
+
     mismatchedPaths.push(path);
     leaves.push({ path, digest: leafDigest(path, input.salts[path] ?? 'unsalted', value) });
   }
 
   return { root: merkleRoot(leaves), mismatchedPaths };
+}
+
+function isEmptyContainer(value: JsonValue): boolean {
+  if (value === null || typeof value !== 'object') return false;
+  return Array.isArray(value) ? value.length === 0 : Object.keys(value).length === 0;
+}
+
+/** True when the committed leaf set contains a leaf nested beneath `path`. */
+function hasStoredDescendant(knownPaths: Set<string>, path: string): boolean {
+  const prefix = path === '' ? '' : `${path}.`;
+  for (const known of knownPaths) {
+    if (known !== path && known.startsWith(prefix)) return true;
+  }
+  return false;
 }
