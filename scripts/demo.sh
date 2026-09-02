@@ -32,14 +32,36 @@ trap cleanup EXIT
 command -v jq >/dev/null || { echo "This demo needs jq (brew install jq)"; exit 1; }
 command -v sqlite3 >/dev/null || { echo "This demo needs the sqlite3 CLI"; exit 1; }
 
+# node is launched directly rather than through npx. npx would be the process we hold a PID
+# for, so `kill ${SERVER_PID}` would leave the real server alive and still holding the port -
+# which surfaces later as EADDRINUSE when the demo restarts. (CI caught this; a faster machine
+# happened to release the port in time and hid it.)
+start_server() {
+  PORT="${PORT}" DATABASE_PATH="${DB}" LOG_LEVEL=error node --import tsx src/index.ts &
+  SERVER_PID=$!
+  for _ in $(seq 1 100); do
+    curl -sf "${BASE}/health" >/dev/null 2>&1 && return 0
+    # Fail fast if the server died rather than silently polling for ten seconds.
+    kill -0 "${SERVER_PID}" 2>/dev/null || { echo "Server exited during startup"; exit 1; }
+    sleep 0.2
+  done
+  echo "Server did not become healthy in time"; exit 1
+}
+
+stop_server() {
+  [[ -z "${SERVER_PID:-}" ]] && return 0
+  kill "${SERVER_PID}" 2>/dev/null || true
+  wait "${SERVER_PID}" 2>/dev/null || true
+  # Wait for the port to actually be released before anyone tries to rebind it.
+  for _ in $(seq 1 100); do
+    curl -sf "${BASE}/health" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+}
+
 bold "0. Starting the service on a fresh database"
 rm -f "${DB}"
-PORT="${PORT}" DATABASE_PATH="${DB}" LOG_LEVEL=error npx tsx src/index.ts &
-SERVER_PID=$!
-for _ in $(seq 1 50); do
-  curl -sf "${BASE}/health" >/dev/null 2>&1 && break
-  sleep 0.2
-done
+start_server
 curl -s "${BASE}/health" | jq -c .
 
 write_event() {
@@ -97,12 +119,9 @@ curl -s "${BASE}/audit/verify" -H "${AUDITOR}" \
 note "Records 1-2 remain trustworthy. Everything from 3 onward is suspect."
 
 bold "7. Restarting on a clean database for Scenarios B and C"
-kill "${SERVER_PID}" 2>/dev/null || true
-wait "${SERVER_PID}" 2>/dev/null || true
+stop_server
 rm -f "${DB}" "${DB}-wal" "${DB}-shm"
-PORT="${PORT}" DATABASE_PATH="${DB}" LOG_LEVEL=error npx tsx src/index.ts &
-SERVER_PID=$!
-for _ in $(seq 1 50); do curl -sf "${BASE}/health" >/dev/null 2>&1 && break; sleep 0.2; done
+start_server
 
 SENSITIVE=$(write_event '{
   "eventType":"RECORD_VIEWED","actorId":"advisor-7",
@@ -154,11 +173,11 @@ note "retention policy, and the report shows it rather than hiding it."
 bold "12. SCENARIO B - Export a verifiable bundle and check it OFFLINE"
 curl -s "${BASE}/audit/export?resourceId=client-100" -H "${AUDITOR}" > demo-bundle.json
 jq -c '{records: (.records|length), bundleHash, globalHead: .chainContext.globalChainHead.seq}' demo-bundle.json
-npx tsx src/cli/verify-bundle.ts demo-bundle.json
+node --import tsx src/cli/verify-bundle.ts demo-bundle.json
 
 bold "13. SCENARIO B - Tamper with the exported bundle and re-check"
 jq '.records[0].actorId = "attacker"' demo-bundle.json > demo-bundle-tampered.json
 mv demo-bundle-tampered.json demo-bundle.json
-npx tsx src/cli/verify-bundle.ts demo-bundle.json || true
+node --import tsx src/cli/verify-bundle.ts demo-bundle.json || true
 
 bold "Demo complete."
