@@ -21,6 +21,7 @@
  *      own audit event. Otherwise the surveillance surface is the one blind spot in the log.
  */
 
+import { narrowFilters, type AccessScope } from '../domain/access-scope.js';
 import { AppError } from '../domain/errors.js';
 import type { StoredRecord } from '../domain/record.js';
 import type { AuditRepository, QueryFilters } from '../storage/repository.js';
@@ -114,7 +115,11 @@ export class ComplianceService {
     private readonly now: () => Date = () => new Date(),
   ) {}
 
-  generateAccessReport(criteria: AccessReportCriteria, generatedBy: string): AccessReport {
+  generateAccessReport(
+    criteria: AccessReportCriteria,
+    generatedBy: string,
+    scope?: AccessScope,
+  ): AccessReport {
     const from = new Date(criteria.from);
     const to = new Date(criteria.to);
     if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
@@ -133,7 +138,10 @@ export class ComplianceService {
     if (criteria.actorId !== undefined) filters.actorId = criteria.actorId;
     if (criteria.clientId !== undefined) filters.resourceId = criteria.clientId;
 
-    const matching = this.collect(filters);
+    // A compliance report is exactly the endpoint an over-broad credential would be used to
+    // sweep the whole log, so object-level scope is applied here too rather than trusted to the
+    // role check.
+    const matching = this.collect(narrowFilters(filters, scope));
 
     const limit = Math.min(criteria.limit ?? 100, 1000);
     const cursor = criteria.cursor === undefined ? 0 : Number(criteria.cursor);

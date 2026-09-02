@@ -6,6 +6,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { narrowFilters, permits, type AccessScope } from '../domain/access-scope.js';
 import { canonicalize } from '../domain/canonical.js';
 import { commitPayload, type Leaf } from '../domain/commitments.js';
 import { DOMAIN, tagged } from '../domain/hash.js';
@@ -45,6 +46,8 @@ export interface RedactionRequest {
   reason: string;
   /** Principal performing the redaction, recorded in the chain. */
   requestedBy: string;
+  /** Object-level scope of the calling credential, if any. */
+  scope?: AccessScope;
 }
 
 export interface ExportBundle {
@@ -139,19 +142,36 @@ export class AuditService {
 
   // ---------------------------------------------------------------- read path
 
-  getByEventId(eventId: string): StoredRecord {
+  /**
+   * Fetch one record, enforcing object-level scope.
+   *
+   * An out-of-scope record returns **404, not 403** - deliberately. A 403 would confirm that
+   * the event id exists, turning this endpoint into an existence oracle that lets a scoped
+   * credential enumerate the log it is not allowed to read. "Not found" and "not yours" are
+   * indistinguishable from outside, which is the whole point.
+   */
+  getByEventId(eventId: string, scope?: AccessScope): StoredRecord {
     const record = this.repo.getByEventId(eventId);
-    if (record === null) throw AppError.notFound(`No audit record with eventId "${eventId}"`);
+    if (record === null || !permits(scope, record)) {
+      throw AppError.notFound(`No audit record with eventId "${eventId}"`);
+    }
     return record;
   }
 
-  query(filters: QueryFilters, limit?: number, cursor?: string): Page<StoredRecord> {
+  query(
+    filters: QueryFilters,
+    limit?: number,
+    cursor?: string,
+    scope?: AccessScope,
+  ): Page<StoredRecord> {
     const size = Math.min(limit ?? this.config.defaultPageSize, this.config.maxPageSize);
     const parsedCursor = cursor === undefined ? undefined : Number(cursor);
     if (parsedCursor !== undefined && (!Number.isInteger(parsedCursor) || parsedCursor < 0)) {
       throw AppError.validation('cursor must be a non-negative integer returned by a prior page');
     }
-    return this.repo.query(filters, size, parsedCursor);
+    // Narrowing happens here rather than in the route so that no future transport can reach the
+    // repository with an unscoped filter set.
+    return this.repo.query(narrowFilters(filters, scope), size, parsedCursor);
   }
 
   // ---------------------------------------------------------------- verification
@@ -241,7 +261,7 @@ export class AuditService {
     }
 
     return this.repo.transaction(() => {
-      const record = this.getByEventId(request.eventId);
+      const record = this.getByEventId(request.eventId, request.scope);
       if (record.lifecycleState === 'archived' || record.payload === null) {
         throw AppError.conflict(
           'Record is archived: its payload has already been destroyed, so there is nothing to redact',
@@ -320,16 +340,23 @@ export class AuditService {
    * a filtered slice needs the full chain or an inclusion proof against a published head - the
    * global head is included so a recipient can demand exactly that.
    */
-  exportBundle(subject: { actorId?: string; resourceType?: string; resourceId?: string }): ExportBundle {
+  exportBundle(
+    subject: { actorId?: string; resourceType?: string; resourceId?: string },
+    scope?: AccessScope,
+  ): ExportBundle {
     const isResource = subject.resourceId !== undefined;
     if (!isResource && subject.actorId === undefined) {
       throw AppError.validation('Specify either actorId, or resourceId (with optional resourceType)');
     }
 
-    const filters: QueryFilters = { includeArchived: true };
-    if (subject.actorId !== undefined) filters.actorId = subject.actorId;
-    if (subject.resourceType !== undefined) filters.resourceType = subject.resourceType;
-    if (subject.resourceId !== undefined) filters.resourceId = subject.resourceId;
+    const baseFilters: QueryFilters = { includeArchived: true };
+    if (subject.actorId !== undefined) baseFilters.actorId = subject.actorId;
+    if (subject.resourceType !== undefined) baseFilters.resourceType = subject.resourceType;
+    if (subject.resourceId !== undefined) baseFilters.resourceId = subject.resourceId;
+    // Export names its subject explicitly, so an out-of-scope subject is a 403 rather than an
+    // empty bundle - an empty bundle would read as "this resource has no history", which is a
+    // materially different and misleading claim.
+    const filters = narrowFilters(baseFilters, scope);
 
     const records: StoredRecord[] = [];
     let cursor: string | undefined;

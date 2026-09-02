@@ -14,6 +14,8 @@ import { AuditRepository } from './storage/repository.js';
 import { AuditService } from './services/audit-service.js';
 import { ComplianceService } from './services/compliance-service.js';
 import { buildRoutes } from './api/routes.js';
+import { CredentialStore } from './api/credentials.js';
+import { FixedWindowRateLimiter, UnlimitedRateLimiter, type RateLimiter } from './api/rate-limit.js';
 import { errorHandler, notFoundHandler } from './api/error-handler.js';
 
 export interface Application {
@@ -22,13 +24,23 @@ export interface Application {
   repo: AuditRepository;
   audit: AuditService;
   compliance: ComplianceService;
+  credentials: CredentialStore;
+  limiter: RateLimiter;
   logger: Logger;
   close: () => void;
+}
+
+export interface ApplicationOptions {
+  /** Injected so rate-limit tests can advance time instead of sleeping. */
+  clock?: () => number;
+  /** Override the limiter entirely (e.g. UnlimitedRateLimiter in unrelated suites). */
+  limiter?: RateLimiter;
 }
 
 export function createApplication(
   overrides: Partial<Config> = {},
   env: NodeJS.ProcessEnv = process.env,
+  options: ApplicationOptions = {},
 ): Application {
   const config = { ...loadConfig(env), ...overrides };
 
@@ -50,6 +62,12 @@ export function createApplication(
   const repo = new AuditRepository(config.databasePath);
   const audit = new AuditService(repo, config);
   const compliance = new ComplianceService(repo, audit);
+  const credentials = new CredentialStore(config.credentials);
+  const limiter =
+    options.limiter ??
+    (config.rateLimit.enabled
+      ? new FixedWindowRateLimiter(config.rateLimit, options.clock)
+      : new UnlimitedRateLimiter());
 
   const app = express();
   app.disable('x-powered-by');
@@ -72,7 +90,7 @@ export function createApplication(
   );
   app.use(securityHeaders);
 
-  app.use(buildRoutes({ config, audit, compliance }));
+  app.use(buildRoutes({ config, audit, compliance, credentials, limiter }));
   app.use(notFoundHandler);
   app.use(errorHandler(logger));
 
@@ -82,6 +100,8 @@ export function createApplication(
     repo,
     audit,
     compliance,
+    credentials,
+    limiter,
     logger,
     close: () => repo.close(),
   };

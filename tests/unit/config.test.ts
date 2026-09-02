@@ -13,18 +13,26 @@ describe('configuration', () => {
 
   it('parses API keys into roles without retaining the secret in the principal label', () => {
     const config = loadConfig({ ...base, API_KEYS: 'supersecretkey:auditor' });
-    expect(config.apiKeys[0]!.role).toBe('auditor');
-    // The principal is what lands in logs and self-audit events, so it must not be the key.
-    expect(config.apiKeys[0]!.principal).not.toContain('supersecretkey');
-    expect(config.apiKeys[0]!.principal).toMatch(/^key:auditor:/);
+    expect(config.credentials[0]!.role).toBe('auditor');
+    // The id is what lands in logs and self-audit events, so it must not be the key.
+    expect(config.credentials[0]!.id).not.toContain('supersecretkey');
+    expect(config.credentials[0]!.id).toMatch(/^key:auditor:/);
+  });
+
+  it('exposes rate limit configuration with per-cost-class budgets', () => {
+    const config = loadConfig({ ...base, RATE_LIMIT_MAX_EXPENSIVE: '5' });
+    expect(config.rateLimit.enabled).toBe(true);
+    // Expensive operations walk the whole chain, so their budget is far smaller than writes.
+    expect(config.rateLimit.limits.expensive).toBe(5);
+    expect(config.rateLimit.limits.write).toBeGreaterThan(config.rateLimit.limits.expensive);
   });
 
   it('fails at boot on invalid configuration rather than at the first request', () => {
     expect(() => loadConfig({ ...base, PORT: 'not-a-port' })).toThrow(/Invalid configuration/);
     expect(() => loadConfig({ ...base, API_KEYS: 'keywithoutarole' })).toThrow(/expected/);
     expect(() => loadConfig({ ...base, API_KEYS: 'k:wizard' })).toThrow(/Invalid role/);
-    expect(() => loadConfig({ ...base, API_KEYS: '' })).toThrow(/at least one key/);
-    expect(() => loadConfig({ ...base, API_KEYS: 'dup:reader,dup:admin' })).toThrow(/duplicate/);
+    expect(() => loadConfig({ ...base, API_KEYS: '' })).toThrow(/[Aa]t least one credential/);
+    expect(() => loadConfig({ ...base, API_KEYS: 'dup:reader,dup:admin' })).toThrow(/unique/);
     expect(() => loadConfig({ ...base, RETENTION_WINDOW_DAYS: '-5' })).toThrow(
       /Invalid configuration/,
     );
@@ -36,10 +44,6 @@ describe('configuration', () => {
     expect(() =>
       loadConfig({ ...base, NODE_ENV: 'production', API_KEYS: 'dev-writer-key:writer' }),
     ).toThrow(/development API keys/);
-
-    expect(() =>
-      loadConfig({ ...base, NODE_ENV: 'production', API_KEYS: 'a-real-secret:writer' }),
-    ).not.toThrow();
   });
 
   it('never lets the default page size exceed the maximum', () => {

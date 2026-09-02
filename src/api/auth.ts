@@ -1,21 +1,29 @@
 /**
- * Authentication and role-based authorization.
+ * Authentication and authorization.
  *
- * API keys are a prototype-grade mechanism, chosen deliberately and with its limits stated in
- * `docs/ARCHITECTURE.md` §6: they are bearer secrets with no expiry, no rotation and no
- * per-request proof of possession. In production this is mTLS or OIDC-issued short-lived
- * tokens. What is *not* prototype-grade, and would be a real defect if skipped, is the
- * least-privilege split: nothing that can write can also redact.
+ * Three layers, and they answer three different questions:
+ *
+ *   authenticate()      who is calling, and is their credential currently usable?
+ *   requireCapability() may this principal perform this kind of operation?  (RBAC)
+ *   AccessScope         may this principal reach this particular object?    (object-level)
+ *
+ * The third is the one most APIs omit, and its absence is Broken Object Level Authorization.
+ * A role check alone would let any `reader` credential read every record in the log. Scope is
+ * carried on the Principal and enforced in the service layer - see `domain/access-scope.ts`.
  */
 
 import type { NextFunction, Request, Response } from 'express';
-import { AppError } from '../domain/errors.js';
-import { safeEqual } from '../domain/hash.js';
-import type { ApiKeyEntry, Config, Role } from '../config.js';
+import { AppError, type ErrorCode } from '../domain/errors.js';
+import type { AccessScope } from '../domain/access-scope.js';
+import type { CredentialRejection, CredentialStore } from './credentials.js';
+import type { Config, Role } from '../config.js';
 
 export interface Principal {
   role: Role;
+  /** Non-secret credential id; used as the actor on self-audit events. */
   id: string;
+  scope?: AccessScope;
+  expiresAt?: string;
 }
 
 declare module 'express-serve-static-core' {
@@ -33,9 +41,9 @@ declare module 'express-serve-static-core' {
  * history it contributes to.
  */
 export const CAPABILITIES = {
-  writer: ['events:write'],
-  reader: ['events:read'],
-  auditor: ['events:read', 'chain:verify', 'records:export', 'reports:read'],
+  writer: ['events:write', 'identity:read'],
+  reader: ['events:read', 'identity:read'],
+  auditor: ['events:read', 'chain:verify', 'records:export', 'reports:read', 'identity:read'],
   admin: [
     'events:write',
     'events:read',
@@ -44,13 +52,34 @@ export const CAPABILITIES = {
     'reports:read',
     'records:redact',
     'retention:apply',
+    'identity:read',
+    'credentials:read',
   ],
 } as const satisfies Record<Role, readonly string[]>;
 
 export type Capability = (typeof CAPABILITIES)[Role][number];
 
-export function authenticate(config: Config) {
-  return (req: Request, _res: Response, next: NextFunction): void => {
+const REJECTION_RESPONSE: Record<
+  CredentialRejection,
+  { code: ErrorCode; message: string }
+> = {
+  UNKNOWN: { code: 'UNAUTHENTICATED', message: 'Unrecognised API key' },
+  EXPIRED: {
+    code: 'CREDENTIAL_EXPIRED',
+    message: 'This credential has expired. Request a replacement and retry with the new secret.',
+  },
+  REVOKED: {
+    code: 'CREDENTIAL_REVOKED',
+    message: 'This credential has been revoked.',
+  },
+  NOT_YET_VALID: {
+    code: 'CREDENTIAL_NOT_YET_VALID',
+    message: 'This credential is staged but not yet active.',
+  },
+};
+
+export function authenticate(config: Config, store: CredentialStore, now: () => Date = () => new Date()) {
+  return (req: Request, res: Response, next: NextFunction): void => {
     const header = req.header('authorization');
     const apiKeyHeader = req.header('x-api-key');
     const presented =
@@ -61,19 +90,40 @@ export function authenticate(config: Config) {
       return;
     }
 
-    // Every configured key is compared, and each comparison is constant-time, so neither the
-    // number of comparisons nor their duration depends on how much of the key was correct.
-    let matched: ApiKeyEntry | undefined;
-    for (const entry of config.apiKeys) {
-      if (safeEqual(entry.key, presented)) matched = entry;
-    }
+    const result = store.authenticate(presented, now());
 
-    if (matched === undefined) {
-      next(AppError.unauthenticated('Unrecognised API key'));
+    if (!result.ok) {
+      const response = REJECTION_RESPONSE[result.reason];
+      next(
+        response.code === 'UNAUTHENTICATED'
+          ? AppError.unauthenticated(response.message)
+          : AppError.credentialLapsed(response.code, response.message),
+      );
       return;
     }
 
-    req.principal = { role: matched.role, id: matched.principal };
+    const { credential, expiresInMs } = result;
+
+    // Expiry is visible on every successful response, so a client can automate rotation instead
+    // of discovering the lapse as a production outage.
+    if (credential.expiresAt !== undefined) {
+      res.set('X-Credential-Expires-At', credential.expiresAt);
+      const warnMs = config.credentialRotationWarningDays * 86_400_000;
+      if (expiresInMs !== null && expiresInMs <= warnMs) {
+        res.set('X-Credential-Rotation-Due', 'true');
+        res.set(
+          'Warning',
+          `299 - "API credential ${credential.id} expires at ${credential.expiresAt}; rotate it"`,
+        );
+      }
+    }
+
+    req.principal = {
+      role: credential.role,
+      id: credential.id,
+      ...(credential.scope === undefined ? {} : { scope: credential.scope }),
+      ...(credential.expiresAt === undefined ? {} : { expiresAt: credential.expiresAt }),
+    };
     next();
   };
 }

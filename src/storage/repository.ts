@@ -35,6 +35,14 @@ export interface QueryFilters {
   resourceType?: string;
   resourceId?: string;
   eventType?: string;
+  /**
+   * Allow-list forms, injected by object-level access scope (domain/access-scope.ts) rather
+   * than supplied by callers. They exist so a scoped credential's unfiltered query returns
+   * only what it may see, instead of everything.
+   */
+  actorIdIn?: string[];
+  resourceTypeIn?: string[];
+  resourceIdIn?: string[];
   /** Inclusive lower bound on `recordedAt`. */
   from?: string;
   /** Exclusive upper bound on `recordedAt`. */
@@ -218,6 +226,28 @@ export class AuditRepository {
       clauses.push('event_type = @eventType');
       params.eventType = filters.eventType;
     }
+
+    // Scope allow-lists. Values are bound as parameters, never interpolated; only the number of
+    // placeholders is derived from the input length.
+    const inClause = (column: string, prefix: string, values: string[] | undefined): void => {
+      if (values === undefined) return;
+      if (values.length === 0) {
+        // An empty allow-list means "nothing is permitted" and must match no rows. Without this
+        // guard SQLite would see `IN ()` as a syntax error, and a naive fix - dropping the
+        // clause - would silently widen the scope to everything.
+        clauses.push('1 = 0');
+        return;
+      }
+      const names = values.map((value, index) => {
+        const name = `${prefix}${index}`;
+        params[name] = value;
+        return `@${name}`;
+      });
+      clauses.push(`${column} IN (${names.join(', ')})`);
+    };
+    inClause('actor_id', 'scopeActor', filters.actorIdIn);
+    inClause('resource_type', 'scopeResourceType', filters.resourceTypeIn);
+    inClause('resource_id', 'scopeResourceId', filters.resourceIdIn);
     if (filters.from !== undefined) {
       clauses.push('recorded_at >= @from');
       params.from = filters.from;

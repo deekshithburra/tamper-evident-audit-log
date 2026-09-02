@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import request from 'supertest';
-import { createApplication, type Application } from '../src/app.js';
+import { createApplication, type Application, type ApplicationOptions } from '../src/app.js';
 
 export const KEYS = {
   writer: 'test-writer-key',
@@ -12,6 +12,9 @@ export const KEYS = {
 const TEST_ENV = {
   NODE_ENV: 'test',
   LOG_LEVEL: 'silent',
+  // Rate limiting is exercised deliberately in its own suite; leaving it on everywhere would
+  // make unrelated suites fail intermittently once they grew past the window budget.
+  RATE_LIMIT_ENABLED: 'false',
   // Every suite gets its own in-memory database: no fixtures, no cleanup, no cross-test bleed.
   DATABASE_PATH: ':memory:',
   API_KEYS: `${KEYS.writer}:writer,${KEYS.reader}:reader,${KEYS.auditor}:auditor,${KEYS.admin}:admin`,
@@ -35,8 +38,11 @@ const servers = new WeakMap<Application, Server>();
  * Letting supertest manage an ephemeral listener per request has the same dual-stack exposure,
  * multiplied by request count.
  */
-export async function buildTestApp(overrides: NodeJS.ProcessEnv = {}): Promise<Application> {
-  const application = createApplication({}, { ...TEST_ENV, ...overrides });
+export async function buildTestApp(
+  overrides: NodeJS.ProcessEnv = {},
+  options: ApplicationOptions = {},
+): Promise<Application> {
+  const application = createApplication({}, { ...TEST_ENV, ...overrides }, options);
   const server = createServer(application.app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   servers.set(application, server);
@@ -122,4 +128,20 @@ export function tamperDirectly(application: Application, sql: string, params: un
   db.exec('DROP TRIGGER IF EXISTS audit_events_no_delete');
   db.exec('DROP TRIGGER IF EXISTS audit_events_lifecycle_forward_only');
   db.prepare(sql).run(...(params as never[]));
+}
+
+/** An authenticated request helper for an arbitrary key, for suites that mint their own. */
+export function withKey(application: Application, key: string) {
+  const api = client(application);
+  return {
+    write: (body: unknown) => api.write(body, key),
+    read: (query = '') => api.read(query, key),
+    getOne: (eventId: string) => api.getOne(eventId, key),
+    verify: (query = '') => api.verify(query, key),
+    exportBundle: (query: string) => api.exportBundle(query, key),
+    report: (query: string) => api.report(query, key),
+    redact: (eventId: string, body: unknown) => api.redact(eventId, body, key),
+    whoami: () => api.raw.get('/auth/whoami').set('X-API-Key', key),
+    credentials: () => api.raw.get('/auth/credentials').set('X-API-Key', key),
+  };
 }

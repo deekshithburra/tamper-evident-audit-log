@@ -13,6 +13,10 @@ export type ErrorCode =
   | 'FORBIDDEN'
   | 'METHOD_NOT_ALLOWED'
   | 'PAYLOAD_TOO_LARGE'
+  | 'CREDENTIAL_EXPIRED'
+  | 'CREDENTIAL_REVOKED'
+  | 'CREDENTIAL_NOT_YET_VALID'
+  | 'RATE_LIMITED'
   | 'INTERNAL';
 
 export class AppError extends Error {
@@ -45,5 +49,15 @@ export class AppError extends Error {
   }
   static tooLarge(message: string): AppError {
     return new AppError('PAYLOAD_TOO_LARGE', 413, message);
+  }
+  /**
+   * 401 rather than 403 for a lapsed credential: the caller is not authenticated, and the
+   * distinct code lets a client tell "rotate your key" apart from "you were never allowed".
+   */
+  static credentialLapsed(code: ErrorCode, message: string): AppError {
+    return new AppError(code, 401, message);
+  }
+  static rateLimited(message: string): AppError {
+    return new AppError('RATE_LIMITED', 429, message);
   }
 }
