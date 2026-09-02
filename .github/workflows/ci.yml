@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    name: Typecheck, lint, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      # Coverage thresholds are enforced in vitest.config.ts, so a coverage regression fails
+      # the build here rather than being noticed months later.
+      - name: Test with coverage
+        run: npm run test:report
+        env:
+          CI: 'true'
+
+      - name: Publish test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            reports/junit.xml
+            reports/test-results.json
+          retention-days: 30
+
+      - name: Publish coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: reports/coverage
+          retention-days: 30
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage'
+            echo
+            node -e "
+              const s = require('./reports/coverage/coverage-summary.json').total;
+              console.log('| Metric | Covered | Total | % |');
+              console.log('|---|---|---|---|');
+              for (const k of ['statements','branches','functions','lines']) {
+                console.log(\`| \${k} | \${s[k].covered} | \${s[k].total} | \${s[k].pct}% |\`);
+              }
+            "
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The chain guarantee is the product, so the end-to-end tamper demonstration runs in CI too.
+  # If tamper detection ever silently stops working, this job is what catches it.
+  demo:
+    name: End-to-end demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: sudo apt-get update && sudo apt-get install -y jq sqlite3
+      - name: Tamper-detection walkthrough
+        run: npm run demo
+      - name: Crash simulation
+        run: npm run demo:crash

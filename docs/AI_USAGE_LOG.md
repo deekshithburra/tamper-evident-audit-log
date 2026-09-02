@@ -111,6 +111,29 @@ body was another service's error envelope; that is not a flake, that is a misdir
 request. I asked for the actual response text instead of the status code, and the cause was
 obvious within one run. Recorded in [TESTING.md](TESTING.md).
 
+### Session 7 - Review response: API security controls and crash testing
+
+A review of the first submission identified three gaps - no credential lifecycle, no
+object-level authorization, no rate limiting - plus a request for a crash simulation and better
+test reporting. All three security gaps were fair; the second was a genuine vulnerability
+rather than missing polish.
+
+| Prompt intent | Outcome | Decision |
+|---|---|---|
+| Add credential expiry and revocation | Lifecycle fields checked at boot | **Modified.** Checking at boot means a key keeps working until the next deploy, which can be months. Moved every check to request time. |
+| Add object-level authorization | Middleware that filtered results | **Modified, and moved.** A middleware check is bypassed by any future transport that forgets to install it, so enforcement went into the service layer where the scope travels with the operation. |
+| Out-of-scope record response | 403 Forbidden | **Rejected.** A 403 confirms the id exists, which is all an attacker needs to enumerate a log they cannot read. Changed to 404, with a test asserting the two responses are indistinguishable apart from the caller's own echoed id. |
+| Empty scope allow-list handling | Dropped the `IN ()` clause to avoid a SQL syntax error | **Rejected - this one was dangerous.** Dropping the clause silently widens the scope from "nothing permitted" to "everything permitted". Emits `1 = 0` instead. |
+| Rate limiter | One global bucket keyed by IP | **Rejected.** Every caller here is a server behind shared egress, so an IP bucket throttles everyone together or is trivially evaded. Rekeyed by credential and split into three cost classes, because O(n) verification and a single write do not belong in one budget. |
+| Rate limit tests | `setTimeout` waits to cross the window | **Modified.** Injected the clock instead: a limiter tested with sleeps is slow *and* flaky under load. |
+| Crash simulation | Closed and reopened the database in-process | **Rejected.** That tests nothing a normal test does not. Replaced with a spawned child process killed by an uncatchable SIGKILL mid-write. |
+
+**A bug I found by reading the output rather than the assertion.** The crash *demo* script
+initially launched the writer via `npx`, so the PID being killed was npx's - the real writer
+survived and kept committing. The tests were correct (they spawn `process.execPath` directly),
+but the demo was quietly proving nothing. The tell was the record count drifting between two
+reads in the same script. Fixed by launching node directly.
+
 ## Where AI helped most, and least
 
 **Most:** breadth of options at design time (the four redaction schemes, weighed honestly);
@@ -118,7 +141,9 @@ first drafts of mechanical code; test scaffolding once I had specified the asser
 catching things I would have reached late (domain separation); and drafting documentation
 prose from decisions I had already made.
 
-**Least:** anything requiring a judgement about *trust*. Every significant correction in
+**Least:** anything requiring a judgement about *trust*. The session-7 additions extended the
+pattern exactly: a 403 that leaks existence, and an empty allow-list that fails open. Both were
+working code. Every significant correction in
 this log is the same shape - the generated code was functionally correct and quietly weakened
 a security property. Retained salts, mutable flags the verifier trusts, side-channel
 detection, overclaimed guarantees. None would fail a test that wasn't written specifically to

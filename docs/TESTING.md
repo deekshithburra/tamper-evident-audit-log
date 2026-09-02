@@ -1,7 +1,12 @@
 # Testing: Approach, Coverage, and What Is Not Covered
 
-169 tests, 14 files, 95.8% statement coverage, ~2s to run.
-`npm test` · `npm run test:coverage` · `npm run check` (typecheck + lint + test).
+230 tests, 19 files, 96.8% statement coverage, ~4s to run.
+`npm test` · `npm run test:coverage` · `npm run test:report` · `npm run check`.
+
+Captured run output and the full coverage table live in [TEST_REPORT.md](TEST_REPORT.md);
+`npm run test:report` regenerates JUnit XML, structured JSON and an HTML coverage report into
+`reports/`, which CI publishes as build artefacts. Coverage thresholds are enforced in
+`vitest.config.ts`, so a regression fails the build rather than being noticed later.
 
 ## Approach
 
@@ -38,6 +43,11 @@ coverage of the *specification* is visible, not just coverage of the lines.
 | `integration/compliance-report` | 12 | Scope, filtering, purpose findings, integrity evidence, self-auditing, archived inclusion |
 | `integration/concurrency` | 3 | 100 concurrent writes stay unforked; interleaved read/write/verify; interleaved redaction |
 | `integration/auth` | 32 | Full role matrix (24 cases), credential handling, headers, error hygiene |
+| `unit/credentials` | 16 | Expiry, staging, revocation, rotation overlap, inventory, production guards |
+| `integration/credential-lifecycle` | 10 | Per-request lifecycle enforcement, rotation headers, inventory |
+| `integration/object-authorization` | 18 | **BOLA**: cross-tenant reads, existence-oracle behaviour, every route |
+| `integration/rate-limit` | 12 | Budgets by cost class, headers, window rollover, credential isolation |
+| `integration/crash-recovery` | 4 | SIGKILL mid-write: durability of acknowledged writes, no torn records |
 
 ## Tests that assert limits rather than capabilities
 
@@ -74,6 +84,24 @@ the bind fixed it - confirmed over 15 consecutive clean full-suite runs before f
 parallelism was restored. The lesson I'd keep: intermittent failures scattered across
 unrelated tests are usually one shared-resource bug, not several unrelated ones.
 
+## Crash simulation
+
+The one test that checks a claim the rest of the suite only restates. Every other test runs
+in-memory in a process that exits cleanly, which proves nothing about a power cut.
+`crash-recovery.test.ts` spawns a real writer process, kills it with an uncatchable **SIGKILL**
+mid-write, and reopens the file - asserting that every acknowledged write survived, that the
+chain still verifies, that sequence numbers are contiguous, and that a new append links to the
+head that survived.
+
+The second property is the subtle one: a half-written record left behind would be reported by
+the verifier as *tampering*, and a system that cries tamper after every unclean shutdown is one
+nobody will believe when it matters. `npm run demo:crash` shows the same thing interactively.
+
+Honest boundary: SIGKILL proves survival of a *process* crash. It does not simulate host power
+loss with the OS page cache in flight - that needs a VM snapshot or a fault injector.
+`synchronous = FULL` is what covers that case, and this test is what stops it being quietly
+downgraded to `NORMAL` for a throughput win.
+
 ## What is not covered, and why
 
 Stated so a reviewer does not have to discover it:
@@ -84,7 +112,6 @@ Stated so a reviewer does not have to discover it:
 - **Multi-process concurrency.** The concurrency tests run in one process. SQLite's
   `BEGIN IMMEDIATE` and `busy_timeout` are designed for the multi-process case, but I have
   not proven it here.
-- **Crash and durability testing.** `synchronous = FULL` is set; no kill -9 test verifies it.
 - **Fuzzing** of the canonical serializer. The property tests are hand-rolled shuffles, not a
   generative fuzzer; a fuzzer would be a better use of the same effort at larger scale.
 - **Very large chains.** Verification is O(n) and tested at hundreds of records, not millions.

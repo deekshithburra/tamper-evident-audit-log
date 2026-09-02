@@ -4,7 +4,9 @@
   "private": true,
   "description": "Tamper-evident, append-only audit log service with hash-chain verification, retention, structured redaction and verifiable export.",
   "type": "module",
-  "engines": { "node": ">=20.10.0" },
+  "engines": {
+    "node": ">=20.10.0"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
@@ -16,7 +18,10 @@
     "test:coverage": "vitest run --coverage",
     "verify:bundle": "tsx src/cli/verify-bundle.ts",
     "demo": "bash scripts/demo.sh",
-    "check": "npm run typecheck && npm run lint && npm run test"
+    "check": "npm run typecheck && npm run lint && npm run test",
+    "test:report": "TEST_REPORT=true vitest run --coverage",
+    "test:crash": "vitest run tests/integration/crash-recovery.test.ts",
+    "demo:crash": "bash scripts/crash-demo.sh"
   },
   "dependencies": {
     "better-sqlite3": "^11.7.0",

@@ -12,3 +12,6 @@ data/
 !.env.example
 .DS_Store
 *.pdf
+
+# Generated test and coverage output (regenerate with `npm run test:report`)
+reports/

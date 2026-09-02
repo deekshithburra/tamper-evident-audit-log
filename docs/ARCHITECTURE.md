@@ -121,20 +121,55 @@ rather than papering over them.
 
 ## 6. Security posture
 
-- **AuthN**: API keys, compared in constant time, presented via `X-API-Key` or a bearer
-  token. Prototype-grade and labelled as such: bearer secrets with no expiry or rotation.
-  Production wants mTLS or short-lived OIDC tokens; the middleware boundary does not change.
-- **AuthZ**: four roles mapped to capabilities. `writer` cannot read - a compromised event
-  producer is the most exposed component, since it lives inside every application, and must
-  not be able to read the history it contributes to. Only `admin` can redact or run retention.
-- **Input**: strict schemas, no unknown keys (a silently ignored `actorID` typo would return
-  the whole log while the caller believed they had filtered), bounded string lengths, a
-  256 KB body cap, 64 KB payload cap, 512-leaf and depth-12 structural caps.
-- **Output**: field salts are never exposed on read paths; they travel only in exports,
-  where the recipient already holds the plaintext.
-- **Logging**: authorization headers and payload bodies are redacted at the logger. The log
-  is not the audit trail and must not become a second, unprotected copy of it.
+### Authentication - credentials with a lifetime (ADR-0006)
+API keys, compared in constant time, presented via `X-API-Key` or a bearer token. Each
+credential carries `notBefore`, `expiresAt`, `revokedAt` and an optional scope, and **all are
+evaluated per request**, not at boot - a key checked only at startup keeps working until the
+next deploy. Expiry is advertised on every successful response (`X-Credential-Expires-At`, plus
+`X-Credential-Rotation-Due` and a `Warning` inside the warning window) so rotation can be
+automated rather than discovered as an outage. Two credentials may share an `id`, which is how
+zero-downtime rotation is expressed: same principal, two live secrets, overlapping windows.
+Production refuses to boot with development keys, non-expiring credentials, or lifetimes beyond
+`MAX_CREDENTIAL_LIFETIME_DAYS`.
+
+Still prototype-grade in one respect, and labelled as such: these are bearer secrets, not
+proof-of-possession. Production wants mTLS or short-lived OIDC tokens; `CredentialStore` is the
+seam where that gets swapped, and nothing above `authenticate()` cares.
+
+### Authorization - two layers, because they answer different questions
+**Role capabilities (RBAC)** answer *may this principal call this endpoint*. Four roles;
+`writer` cannot read - a compromised event producer is the most exposed component, since it
+lives inside every application, and must not be able to read the history it contributes to.
+Only `admin` can redact or run retention.
+
+**Object-level scope (BOLA mitigation)** answers *may this principal see this record*. A
+credential may be scoped to an allow-list of `actorIds` / `resourceTypes` / `resourceIds`.
+Without this, a legitimately issued `reader` key could walk the entire log by iterating event
+ids and never fail an authorization check. Enforcement lives in the **service layer**, not in
+middleware, so no future transport can bypass it. An out-of-scope single record returns
+**404, not 403**, because 403 would confirm the id exists and turn the API into an existence
+oracle.
+
+### Rate limiting
+Per credential (not per IP - every caller is a server behind shared egress), in three cost
+classes. Verification, export and reporting are O(n) over the whole log and get a much smaller
+budget than writes, because no sensible write budget would stop a caller looping `/audit/verify`.
+Responses carry `X-RateLimit-*`; a 429 carries `Retry-After`. In-memory fixed window: exact and
+explainable, but per-instance - production wants a shared counter or a gateway.
+
+### Input, output, logging, errors
+- **Input**: strict schemas, no unknown keys (a silently ignored `actorID` typo would return the
+  whole log while the caller believed they had filtered), bounded string lengths, a 256 KB body
+  cap, 64 KB payload cap, 512-leaf and depth-12 structural caps.
+- **Output**: field salts are never exposed on read paths; they travel only in exports, where
+  the recipient already holds the plaintext. Credential secrets never appear in any response,
+  including the credential inventory.
+- **Logging**: authorization headers and payload bodies are redacted at the logger. The log is
+  not the audit trail and must not become a second, unprotected copy of it.
 - **Errors**: stable machine-readable codes; unexpected errors never leak a message or stack.
+  `CREDENTIAL_EXPIRED` / `CREDENTIAL_REVOKED` / `RATE_LIMITED` are distinct from
+  `UNAUTHENTICATED` and `FORBIDDEN` so a client can tell "rotate your key" from "you were never
+  allowed" from "slow down".
 
 ## 7. Scaling beyond this prototype
 
@@ -155,6 +190,8 @@ throughput. Accepted for a prototype and quantified rather than hidden. The path
 | Method | Path | Capability | Purpose |
 |---|---|---|---|
 | GET | `/health` | none | Liveness, record count, chain head |
+| GET | `/auth/whoami` | `identity:read` | Own role, capabilities, scope, expiry |
+| GET | `/auth/credentials` | `credentials:read` | Credential inventory: state, expiry, rotation pressure |
 | POST | `/audit/events` | `events:write` | Append an event |
 | GET | `/audit/events` | `events:read` | Filter + paginate |
 | GET | `/audit/events/:eventId` | `events:read` | Fetch one record |

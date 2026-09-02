@@ -5,7 +5,7 @@ modification, deletion or reordering **detectable** through a SHA-256 hash chain
 still supporting the two things a real compliance system needs and a naive hash chain
 forbids: **retention** and **redaction of sensitive fields**.
 
-169 tests · 95.8% statement coverage · runs in ~2 seconds.
+230 tests · 96.8% statement coverage · runs in ~4 seconds.
 
 ---
 
@@ -15,7 +15,7 @@ forbids: **retention** and **redaction of sensitive fields**.
 node --version          # 20.10+ required (developed on 22)
 npm install
 cp .env.example .env     # development API keys are in here
-npm test                 # 169 tests
+npm test                 # 230 tests
 npm run dev              # http://localhost:3000
 ```
 
@@ -60,8 +60,9 @@ offline, and the Scenario C compliance report.
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, data model, hash design, **threat model incl. what is not caught** |
 | [docs/SCENARIOS.md](docs/SCENARIOS.md) | Scenarios A, B, C: decomposition, execution, validation |
 | [docs/SCENARIO_C.md](docs/SCENARIO_C.md) | The ambiguous requirement worked in full |
-| [docs/adr/](docs/adr/) | Five decision records, each with the options rejected |
+| [docs/adr/](docs/adr/) | Six decision records, each with the options rejected |
 | [docs/TESTING.md](docs/TESTING.md) | Approach, the defects tests found, and what is **not** covered |
+| [docs/TEST_REPORT.md](docs/TEST_REPORT.md) | Captured run output, coverage table, crash-simulation results |
 | [docs/AI_USAGE_LOG.md](docs/AI_USAGE_LOG.md) | What was prompted, accepted, modified, rejected - and why |
 | [docs/TASK_PLAN.md](docs/TASK_PLAN.md) | Task decomposition, dependencies, and where the plan changed |
 
@@ -113,6 +114,8 @@ All endpoints except `/health` require an API key (`X-API-Key` or `Authorization
 | `GET` | `/audit/events?actorId=&resourceType=&resourceId=&eventType=&from=&to=&limit=&cursor=&includeArchived=` | reader, auditor, admin |
 | `GET` | `/audit/events/:eventId` | reader, auditor, admin |
 | `PUT` `PATCH` `DELETE` | `/audit/events*` | **405 - append-only** |
+| `GET` | `/auth/whoami` | any authenticated |
+| `GET` | `/auth/credentials` | admin |
 | `GET` | `/audit/verify?fromSeq=` | auditor, admin (409 if broken) |
 | `POST` | `/audit/retention/apply` | admin |
 | `POST` | `/audit/events/:eventId/redactions` | admin |
@@ -121,6 +124,31 @@ All endpoints except `/health` require an API key (`X-API-Key` or `Authorization
 
 Roles are least-privilege on purpose: a `writer` cannot read the log it writes to, and only
 an `admin` can redact. Rationale in [ARCHITECTURE §6](docs/ARCHITECTURE.md).
+
+### Credentials, scope and rate limits
+
+Roles answer *may you call this endpoint*. They do not answer *may you see this record* - and
+that gap is Broken Object Level Authorization, which is why a credential can also carry an
+**object-level scope**:
+
+```jsonc
+// API_CREDENTIALS
+[{ "id": "desk-west", "secret": "...", "role": "auditor",
+   "expiresAt": "2026-12-01T00:00:00.000Z",
+   "scope": { "resourceIds": ["client-100", "client-101"] } }]
+```
+
+A scoped credential's unfiltered query returns only what it may see; an out-of-scope record
+returns **404, not 403**, so the API cannot be used as an existence oracle. Credentials expire,
+can be staged (`notBefore`) and revoked, and two entries sharing an `id` express a zero-downtime
+rotation. Rate limits are per credential in three cost classes, because verification and export
+are O(n) over the whole log while a write is not. Full reasoning in
+[ADR-0006](docs/adr/0006-api-security-controls.md).
+
+```bash
+curl -s localhost:3000/auth/whoami       -H 'X-API-Key: dev-auditor-key' | jq
+curl -s localhost:3000/auth/credentials  -H 'X-API-Key: dev-admin-key'   | jq
+```
 
 ### Verify an exported bundle offline
 
@@ -146,10 +174,17 @@ fails at boot, not at the first request.
 | `DATABASE_PATH` | `./data/audit.db` | SQLite file, or `:memory:` |
 | `MAX_CLOCK_SKEW_MS` | `300000` | Bound on caller-supplied `timestamp` |
 | `RETENTION_WINDOW_DAYS` | `365` | Default archival window |
-| `API_KEYS` | dev keys | `key:role` pairs; `writer`/`reader`/`auditor`/`admin` |
+| `API_KEYS` | dev keys | Simple `secret:role` pairs |
+| `API_CREDENTIALS` | — | JSON credentials with lifecycle + scope; wins over `API_KEYS` |
+| `CREDENTIAL_ROTATION_WARNING_DAYS` | `14` | When to start flagging rotation-due |
+| `MAX_CREDENTIAL_LIFETIME_DAYS` | `90` | Max credential lifetime, enforced in production |
+| `RATE_LIMIT_ENABLED` | `true` | Per-credential rate limiting |
+| `RATE_LIMIT_MAX_WRITE` / `_READ` / `_EXPENSIVE` | `1200`/`600`/`30` | Budgets per window |
 | `MAX_PAGE_SIZE` / `DEFAULT_PAGE_SIZE` | `200` / `50` | Pagination bounds |
 
-The service refuses to start in production with the development keys from `.env.example`.
+The service refuses to start in production with the development keys from `.env.example`, with
+any non-expiring credential, or with a credential whose lifetime exceeds the configured maximum.
+A warning in a startup log is a control nobody enforces, so these are refusals.
 
 ## Scripts
 
@@ -157,6 +192,8 @@ The service refuses to start in production with the development keys from `.env.
 |---|---|
 | `npm run dev` | Run with reload |
 | `npm test` / `npm run test:coverage` | Tests / with coverage |
+| `npm run test:report` | Coverage + JUnit/JSON run output into `reports/` |
+| `npm run demo:crash` | Crash simulation: SIGKILL mid-write, then durability + integrity check |
 | `npm run check` | Typecheck + lint + test |
 | `npm run demo` | Full end-to-end demonstration |
 | `npm run verify:bundle -- <file>` | Offline bundle verification |

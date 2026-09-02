@@ -3,8 +3,8 @@
 ## 1. What was built
 
 A tamper-evident, append-only audit log service. Node 20+, TypeScript (strict), Express,
-SQLite. ~4,600 lines across source and tests; 169 tests; 95.8% statement coverage; full
-suite runs in about two seconds.
+SQLite. ~6,000 lines across source and tests; 230 tests; 96.8% statement coverage; full
+suite runs in about four seconds.
 
 - **Scenario A** - write and query APIs with filtering and stable pagination; SHA-256 hash
   chain; `GET /audit/verify` reporting intactness, the first inconsistency, and the *type* of
@@ -41,6 +41,10 @@ decomposition and the two places the plan changed under contact with the code.
 | Both timestamps, caller's bounded | Domain time and system time answer different questions; only one can be trusted | REQUIREMENTS §3.1 |
 | Keyset pagination | Offset pages skip or repeat under concurrent writes | ARCHITECTURE §8 |
 | `writer` cannot read | A compromised event producer must not be able to read the history it feeds | ARCHITECTURE §6 |
+| Credentials expire, stage and revoke; checked per request | A key validated only at boot keeps working until the next deploy | ADR-0006 |
+| Object-level scope enforced in the service layer | Role checks alone let any reader walk the whole log by event id (BOLA) | ADR-0006 |
+| Out-of-scope record returns 404, not 403 | A 403 confirms the id exists, turning the API into an existence oracle | ADR-0006 |
+| Rate limits per credential, in three cost classes | Verify/export/report are O(n); no write budget would stop a caller looping them | ADR-0006 |
 
 ## 4. Risks and trade-offs
 
@@ -50,7 +54,9 @@ decomposition and the two places the plan changed under contact with the code.
 | **Tail truncation** | High | Same root cause, same fix. Asserted as a known limitation in the tamper suite rather than glossed over |
 | Single-writer throughput ceiling | Medium | Accepted for a prototype; scaling path in ARCHITECTURE §7. Reasoned, not benchmarked |
 | O(n) verification on large chains | Medium | Checkpointing designed, not built. `fromSeq` allows suffix verification today |
-| API keys as bearer secrets | Medium | Prototype-grade and labelled; roles are least-privilege; production wants mTLS/OIDC |
+| API keys as bearer secrets | Medium | Prototype-grade and labelled: credentials now expire, stage, revoke and carry object-level scope, but they are still bearer tokens, not proof-of-possession. Production wants mTLS/OIDC; `CredentialStore` is the seam |
+| Rate limiter state is per-instance | Low | Behind N replicas the effective limit is N x. Production wants a shared counter or gateway; `RateLimiter` is a one-method interface |
+| Scope is static configuration | Low | A real deployment binds it to identity-provider claims rather than an environment variable |
 | Retained leaf digests are not independently re-derivable for redacted fields | Low | Inherent to erasure. They remain bound into the root and chain, so they cannot be altered undetected |
 | Payload *shape* survives redaction | Low | Usually desirable in audit. Redact the parent path if a field name is itself sensitive |
 | SQLite in production | Low | Behind a repository interface; Postgres is a one-file change |
@@ -74,7 +80,9 @@ decomposition and the two places the plan changed under contact with the code.
   signed checkpoint covering the removed range.
 - Verification is synchronous and blocks the event loop for the duration; on a large chain
   it belongs in a worker.
-- No load, crash-durability, or multi-process concurrency testing ([TESTING.md](TESTING.md)).
+- No load or multi-process concurrency testing ([TESTING.md](TESTING.md)). Crash durability
+  *is* now covered by a SIGKILL-based suite, but only for process death - not host power loss
+  with the page cache in flight.
 - The compliance report can only report what it was told; an application that reads client
   data without emitting an event is invisible to it, and that is a limitation of the
   approach rather than of this implementation.
@@ -92,6 +100,8 @@ In priority order, and the order matters:
 4. **Per-writer signatures**, narrowing assumption 1 from "trusted producers" to
    "authenticated producers with non-repudiation".
 5. **A generative fuzzer** for the canonical serializer, replacing hand-rolled shuffles.
+6. **Shared-store rate limiting and IdP-bound scope**, replacing the two deployment-shaped
+   compromises in ADR-0006.
 
 ## 8. What I would want to be asked about
 
